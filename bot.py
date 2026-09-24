@@ -1,8 +1,8 @@
 import os
-import json
 import threading
 
 from flask import Flask
+from pymongo import MongoClient
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -15,11 +15,14 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-SETTINGS_FILE = "settings.json"
+MONGO_URI = os.environ["MONGO_URI"]
+MONGO_DB = os.environ.get("MONGO_DB", "caption_thumbnail_bot")
+
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 
 
 # =========================================================
-# FLASK SERVER - RENDER KEEP ALIVE
+# FLASK SERVER
 # =========================================================
 
 app = Flask(__name__)
@@ -36,26 +39,13 @@ def run_flask():
 
 
 # =========================================================
-# SETTINGS
+# MONGODB
 # =========================================================
 
-def load_settings():
-    if not os.path.exists(SETTINGS_FILE):
-        return {}
+mongo = MongoClient(MONGO_URI)
 
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_settings(data):
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-
-settings = load_settings()
+db = mongo[MONGO_DB]
+settings_collection = db["settings"]
 
 
 # =========================================================
@@ -78,11 +68,43 @@ user_state = {}
 
 
 # =========================================================
+# ADMIN CHECK
+# =========================================================
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+# =========================================================
+# GET SETTINGS
+# =========================================================
+
+def get_settings():
+
+    data = settings_collection.find_one(
+        {"_id": "main"}
+    )
+
+    if not data:
+        return {}
+
+    return data
+
+
+# =========================================================
 # START
 # =========================================================
 
 @bot.on_message(filters.command("start"))
 async def start(client, message):
+
+    if not is_admin(message.from_user.id):
+
+        await message.reply_text(
+            "❌ यह Bot केवल Admin के लिए है."
+        )
+
+        return
 
     buttons = InlineKeyboardMarkup([
         [
@@ -105,7 +127,7 @@ async def start(client, message):
         ],
         [
             InlineKeyboardButton(
-                "🗑️ Clear Settings",
+                "🗑️ Clear",
                 callback_data="clear"
             )
         ]
@@ -113,9 +135,8 @@ async def start(client, message):
 
     await message.reply_text(
         "🤖 **Caption + Thumbnail Bot**\n\n"
-        "Welcome!\n\n"
-        "पहले Thumbnail और Caption set करें।\n"
-        "उसके बाद कोई Photo/Video भेजें।",
+        "Welcome Admin! 👋🏻\n\n"
+        "नीचे दिए buttons से अपना Thumbnail और Caption set करें.",
         reply_markup=buttons
     )
 
@@ -125,16 +146,23 @@ async def start(client, message):
 # =========================================================
 
 @bot.on_callback_query()
-async def callbacks(client, query):
+async def callback_handler(client, query):
 
-    user_id = str(query.from_user.id)
+    if not is_admin(query.from_user.id):
+
+        await query.answer(
+            "❌ Admin Only!",
+            show_alert=True
+        )
+
+        return
 
     if query.data == "set_thumb":
 
-        user_state[user_id] = "thumbnail"
+        user_state[query.from_user.id] = "thumbnail"
 
         await query.message.reply_text(
-            "🖼️ **Thumbnail Set करने के लिए Photo भेजें।**"
+            "🖼️ अब अपना **Thumbnail Photo** भेजें."
         )
 
         await query.answer()
@@ -142,10 +170,10 @@ async def callbacks(client, query):
 
     elif query.data == "set_caption":
 
-        user_state[user_id] = "caption"
+        user_state[query.from_user.id] = "caption"
 
         await query.message.reply_text(
-            "📝 **अब अपना Caption भेजें।**"
+            "📝 अब अपना **Caption** भेजें."
         )
 
         await query.answer()
@@ -153,14 +181,15 @@ async def callbacks(client, query):
 
     elif query.data == "preview":
 
-        user_data = settings.get(user_id, {})
+        data = get_settings()
 
-        caption = user_data.get("caption")
-        thumbnail = user_data.get("thumbnail")
+        caption = data.get("caption")
+        thumbnail = data.get("thumbnail")
 
         if not caption and not thumbnail:
+
             await query.message.reply_text(
-                "❌ अभी कोई Caption या Thumbnail Set नहीं है।"
+                "❌ अभी कोई Caption या Thumbnail saved नहीं है."
             )
 
         elif thumbnail:
@@ -168,7 +197,7 @@ async def callbacks(client, query):
             await client.send_photo(
                 chat_id=query.message.chat.id,
                 photo=thumbnail,
-                caption=caption or "No Caption Set"
+                caption=caption or "No Caption"
             )
 
         else:
@@ -182,149 +211,213 @@ async def callbacks(client, query):
 
     elif query.data == "clear":
 
-        settings.pop(user_id, None)
-        save_settings(settings)
+        settings_collection.delete_one(
+            {"_id": "main"}
+        )
 
-        user_state.pop(user_id, None)
+        user_state.pop(query.from_user.id, None)
 
         await query.message.reply_text(
-            "🗑️ आपका Caption और Thumbnail Clear कर दिया गया।"
+            "🗑️ **Caption और Thumbnail Clear हो गए.**"
         )
 
         await query.answer()
 
 
 # =========================================================
-# SET THUMBNAIL
+# PHOTO HANDLER
 # =========================================================
 
 @bot.on_message(filters.photo)
 async def photo_handler(client, message):
 
-    user_id = str(message.from_user.id)
+    if not is_admin(message.from_user.id):
+        return
 
-    state = user_state.get(user_id)
+    state = user_state.get(
+        message.from_user.id
+    )
+
+    # -------------------------------
+    # SET THUMBNAIL
+    # -------------------------------
 
     if state == "thumbnail":
 
-        photo = message.photo
+        file_id = message.photo.file_id
 
-        settings.setdefault(user_id, {})
+        settings_collection.update_one(
+            {"_id": "main"},
+            {
+                "$set": {
+                    "thumbnail": file_id
+                }
+            },
+            upsert=True
+        )
 
-        settings[user_id]["thumbnail"] = str(photo.file_id)
-
-        save_settings(settings)
-
-        user_state.pop(user_id, None)
+        user_state.pop(
+            message.from_user.id,
+            None
+        )
 
         await message.reply_text(
-            "✅ **Thumbnail Successfully Saved!**\n\n"
-            "अब `/start` दबाकर Caption Set कर सकते हैं।"
+            "✅ **Thumbnail Successfully Saved!**"
         )
 
         return
 
+    # -------------------------------
+    # NORMAL PHOTO
+    # -------------------------------
 
-    # Normal photo
-    await send_result(client, message)
+    await send_photo_result(
+        client,
+        message
+    )
 
 
 # =========================================================
-# SET CAPTION
+# CAPTION HANDLER
 # =========================================================
 
 @bot.on_message(
-    filters.text & ~filters.command(
+    filters.text
+    & ~filters.command(
         ["start", "preview", "clear"]
     )
 )
 async def caption_handler(client, message):
 
-    user_id = str(message.from_user.id)
+    if not is_admin(message.from_user.id):
+        return
 
-    state = user_state.get(user_id)
+    state = user_state.get(
+        message.from_user.id
+    )
 
     if state == "caption":
 
-        settings.setdefault(user_id, {})
-
-        settings[user_id]["caption"] = message.text
-
-        save_settings(settings)
-
-        user_state.pop(user_id, None)
-
-        await message.reply_text(
-            "✅ **Caption Successfully Saved!**\n\n"
-            "अब कोई Photo/Video भेजें।"
+        settings_collection.update_one(
+            {"_id": "main"},
+            {
+                "$set": {
+                    "caption": message.text
+                }
+            },
+            upsert=True
         )
 
-        return
+        user_state.pop(
+            message.from_user.id,
+            None
+        )
+
+        await message.reply_text(
+            "✅ **Caption Successfully Saved!**"
+        )
 
 
 # =========================================================
-# VIDEO
+# VIDEO HANDLER
 # =========================================================
 
 @bot.on_message(filters.video)
 async def video_handler(client, message):
 
-    await send_result(client, message)
+    if not is_admin(message.from_user.id):
+        return
+
+    await send_video_result(
+        client,
+        message
+    )
 
 
 # =========================================================
-# DOCUMENT
+# DOCUMENT HANDLER
 # =========================================================
 
 @bot.on_message(filters.document)
 async def document_handler(client, message):
 
-    await send_result(client, message)
+    if not is_admin(message.from_user.id):
+        return
 
+    data = get_settings()
 
-# =========================================================
-# SEND FINAL RESULT
-# =========================================================
-
-async def send_result(client, message):
-
-    user_id = str(message.from_user.id)
-
-    user_data = settings.get(user_id, {})
-
-    caption = user_data.get(
+    caption = data.get(
         "caption",
-        "Caption Set नहीं है।"
+        ""
     )
 
-    thumbnail = user_data.get("thumbnail")
+    await client.send_document(
+        chat_id=message.chat.id,
+        document=message.document.file_id,
+        caption=caption
+    )
 
-    # ---------------------------------------------
-    # PHOTO
-    # ---------------------------------------------
 
-    if message.photo:
+# =========================================================
+# SEND PHOTO RESULT
+# =========================================================
 
-        if thumbnail:
+async def send_photo_result(
+    client,
+    message
+):
 
-            await client.send_photo(
-                chat_id=message.chat.id,
-                photo=thumbnail,
-                caption=caption
-            )
+    data = get_settings()
 
-        else:
+    caption = data.get(
+        "caption",
+        ""
+    )
 
-            await message.reply_photo(
-                photo=message.photo.file_id,
-                caption=caption
-            )
+    thumbnail = data.get(
+        "thumbnail"
+    )
 
-    # ---------------------------------------------
-    # VIDEO
-    # ---------------------------------------------
+    if thumbnail:
 
-    elif message.video:
+        await client.send_photo(
+            chat_id=message.chat.id,
+            photo=thumbnail,
+            caption=caption
+        )
+
+    else:
+
+        await client.send_photo(
+            chat_id=message.chat.id,
+            photo=message.photo.file_id,
+            caption=caption
+        )
+
+
+# =========================================================
+# SEND VIDEO RESULT
+# =========================================================
+
+async def send_video_result(
+    client,
+    message
+):
+
+    data = get_settings()
+
+    caption = data.get(
+        "caption",
+        ""
+    )
+
+    # Telegram/Pyrogram video thumbnail
+    # के लिए saved thumbnail का file_id इस्तेमाल
+    thumbnail = data.get(
+        "thumbnail"
+    )
+
+    try:
 
         await client.send_video(
             chat_id=message.chat.id,
@@ -333,37 +426,42 @@ async def send_result(client, message):
             thumb=thumbnail
         )
 
-    # ---------------------------------------------
-    # DOCUMENT
-    # ---------------------------------------------
+    except Exception:
 
-    elif message.document:
+        # अगर thumbnail Telegram द्वारा accept
+        # नहीं होता तो बिना custom thumb भेजें
 
-        await client.send_document(
+        await client.send_video(
             chat_id=message.chat.id,
-            document=message.document.file_id,
+            video=message.video.file_id,
             caption=caption
         )
 
 
 # =========================================================
-# COMMANDS
+# PREVIEW COMMAND
 # =========================================================
 
 @bot.on_message(filters.command("preview"))
 async def preview_command(client, message):
 
-    user_id = str(message.from_user.id)
+    if not is_admin(message.from_user.id):
+        return
 
-    user_data = settings.get(user_id, {})
+    data = get_settings()
 
-    caption = user_data.get("caption")
-    thumbnail = user_data.get("thumbnail")
+    caption = data.get(
+        "caption"
+    )
+
+    thumbnail = data.get(
+        "thumbnail"
+    )
 
     if not caption and not thumbnail:
 
         await message.reply_text(
-            "❌ कोई Caption/Thumbnail Set नहीं है।"
+            "❌ कोई Caption या Thumbnail saved नहीं है."
         )
 
         return
@@ -383,24 +481,32 @@ async def preview_command(client, message):
         )
 
 
+# =========================================================
+# CLEAR COMMAND
+# =========================================================
+
 @bot.on_message(filters.command("clear"))
 async def clear_command(client, message):
 
-    user_id = str(message.from_user.id)
+    if not is_admin(message.from_user.id):
+        return
 
-    settings.pop(user_id, None)
+    settings_collection.delete_one(
+        {"_id": "main"}
+    )
 
-    save_settings(settings)
-
-    user_state.pop(user_id, None)
+    user_state.pop(
+        message.from_user.id,
+        None
+    )
 
     await message.reply_text(
-        "🗑️ Caption और Thumbnail Clear हो गए।"
+        "🗑️ **Caption और Thumbnail Clear हो गए.**"
     )
 
 
 # =========================================================
-# RUN
+# RUN BOT
 # =========================================================
 
 if __name__ == "__main__":
@@ -410,6 +516,8 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    print("🤖 Bot Started Successfully!")
+    print(
+        "🤖 Caption + Thumbnail Bot Started!"
+    )
 
     bot.run()
